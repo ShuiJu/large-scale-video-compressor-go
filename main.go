@@ -61,8 +61,9 @@ var (
 type VideoInfo struct {
 	Width            int
 	Height           int
-	Bitrate          int  // kbps
-	BitrateEstimated bool // 由文件大小/时长估算，非容器元数据
+	Bitrate          int    // kbps
+	BitrateEstimated bool   // 由文件大小/时长估算，非容器元数据
+	CodecName        string // 视频流编码格式（如 h264, hevc, mpeg4 …）
 }
 
 // TaskKind 经过 probe 分类后的任务类型
@@ -219,6 +220,7 @@ func probeVideo(input string) (VideoInfo, error) {
 	var probe struct {
 		Streams []struct {
 			CodecType string `json:"codec_type"`
+			CodecName string `json:"codec_name"`
 			Width     int    `json:"width"`
 			Height    int    `json:"height"`
 		} `json:"streams"`
@@ -236,6 +238,7 @@ func probeVideo(input string) (VideoInfo, error) {
 		if s.CodecType == "video" && s.Width > 0 {
 			info.Width = s.Width
 			info.Height = s.Height
+			info.CodecName = s.CodecName
 			break
 		}
 	}
@@ -432,6 +435,14 @@ func runNVEnc(ctx context.Context, input, output string, info VideoInfo) error {
 		"--thread-throttling", "output=on,perfmonitor=on",
 		"--audio-codec", "1?aac:aac_coder=twoloop",
 		"--audio-bitrate", "192",
+	}
+	// NVDEC 不支持 MPEG4 Part2 / VP8 等格式，遇到则强制软解避免 cuvidCreateDecoder 失败
+	nvdecSupported := map[string]bool{
+		"h264": true, "hevc": true, "av1": true, "vp9": true, "mpeg2video": true,
+	}
+	if !nvdecSupported[info.CodecName] {
+		args = append(args, "--avsw")
+		logf("  [NVEnc] 输入编码 %q 不支持 NVDEC，使用软解 (--avsw)", info.CodecName)
 	}
 	if scaleW, scaleH := buildNVEncScaleSize(info.Width, info.Height); scaleW > 0 {
 		// NVEncC 9.x 缩放语法：
