@@ -37,9 +37,8 @@ const (
 	MIN_IO_WORKERS = 4
 	MAX_IO_WORKERS = 16
 
-	// 夜间静默窗口（本地时间，硬编码，不通过参数控制）
-	// 静默区间：每天 QUIET_START_HOUR:00 ~ QUIET_END_HOUR:00（不含）
-	// 即 00:00:00 ~ 08:59:59 期间暂停，09:00:00 恢复
+	// 夜间静默窗口（本地时间，硬编码）
+	// 静默区间：00:00:00 ~ 08:59:59，09:00:00 恢复
 	QUIET_START_HOUR = 0 // 00:00
 	QUIET_END_HOUR   = 9 // 09:00 恢复
 )
@@ -282,8 +281,10 @@ func buildScaleFilter(w, h int) string {
 	)
 }
 
-// buildNVEncResizeParam 生成 NVEncC --vf resize 参数（不需要缩放时返回空字符串）
-func buildNVEncResizeParam(w, h int) string {
+// buildNVEncScaleSize 计算 NVEncC 缩放后的目标宽高。
+// 返回 (0, 0) 表示不需要缩放。
+// 规则：横向 长边≤1920 短边≤1080；竖向 长边≤1920 短边≤1080，保持宽高比，宽高取偶数。
+func buildNVEncScaleSize(w, h int) (newW, newH int) {
 	isLandscape := w >= h
 	var maxW, maxH int
 	if isLandscape {
@@ -292,7 +293,7 @@ func buildNVEncResizeParam(w, h int) string {
 		maxW, maxH = 1080, 1920
 	}
 	if w <= maxW && h <= maxH {
-		return ""
+		return 0, 0 // 不需要缩放
 	}
 	scaleW := float64(maxW) / float64(w)
 	scaleH := float64(maxH) / float64(h)
@@ -300,9 +301,9 @@ func buildNVEncResizeParam(w, h int) string {
 	if scaleH < scaleW {
 		scale = scaleH
 	}
-	newW := (int(float64(w)*scale) / 2) * 2
-	newH := (int(float64(h)*scale) / 2) * 2
-	return fmt.Sprintf("resize=w=%d,h=%d,algo=spline36", newW, newH)
+	newW = (int(float64(w)*scale) / 2) * 2
+	newH = (int(float64(h)*scale) / 2) * 2
+	return newW, newH
 }
 
 // outputPath 生成最终输出文件路径（带编码后缀）
@@ -404,16 +405,22 @@ func runNVEnc(ctx context.Context, input, output string, info VideoInfo) error {
 		logf("  [DRYRUN] NVEncC AV1 编码: %s → %s", input, output)
 		return nil
 	}
-	tmpOut := output + ".nvenc.tmp.mp4"
-	defer os.Remove(tmpOut)
+	// nvencRaw：NVEncC 的直接输出，未经 faststart remux
+	// remuxOut：ffmpeg remux 后的结果，有 .mp4 扩展名，ffmpeg 能正确识别格式
+	// output  ：由 execEncode 传入，是 finalOut+".__tmp__"，最终 rename 到 finalOut
+	nvencRaw := output + ".nvenc.raw.mp4"
+	remuxOut := output + ".nvenc.remux.mp4"
+	defer os.Remove(nvencRaw)
+	defer os.Remove(remuxOut)
 
 	args := []string{
 		"-c", "av1",
-		"--level", "6.1",
+		// --level 故意不设置，让 NVEncC 根据分辨率和码率自动选择
+		// 手动指定 6.1 会导致非标准分辨率（如 750x1000）触发 Invalid Level 错误
 		"--preset", "quality",
 		"--profile", "high",
 		"-i", input,
-		"-o", tmpOut,
+		"-o", nvencRaw,
 		"--vbr", strconv.Itoa(NVENC_TARGET_KBP),
 		"--output-buf", "128",
 		"--multipass", "2pass-full",
@@ -426,9 +433,16 @@ func runNVEnc(ctx context.Context, input, output string, info VideoInfo) error {
 		"--audio-codec", "1?aac:aac_coder=twoloop",
 		"--audio-bitrate", "192",
 	}
-	if resizeParam := buildNVEncResizeParam(info.Width, info.Height); resizeParam != "" {
-		args = append(args, "--vf", resizeParam)
-		logf("  [NVEnc] 分辨率缩放 %dx%d → %s", info.Width, info.Height, resizeParam)
+	if scaleW, scaleH := buildNVEncScaleSize(info.Width, info.Height); scaleW > 0 {
+		// NVEncC 9.x 缩放语法：
+		//   --output-res WxH   指定输出分辨率
+		//   --vpp-resize algo=spline36   指定缩放算法
+		outputRes := fmt.Sprintf("%dx%d", scaleW, scaleH)
+		args = append(args,
+			"--output-res", outputRes,
+			"--vpp-resize", "algo=spline36",
+		)
+		logf("  [NVEnc] 分辨率缩放 %dx%d → %dx%d", info.Width, info.Height, scaleW, scaleH)
 	}
 
 	cmd := exec.CommandContext(ctx, NVENCC_PATH, args...)
@@ -438,16 +452,22 @@ func runNVEnc(ctx context.Context, input, output string, info VideoInfo) error {
 		return fmt.Errorf("NVEncC: %w", err)
 	}
 
+	// faststart remux：输出必须有 .mp4 扩展名，ffmpeg 才能推断容器格式
 	remux := exec.CommandContext(ctx, FFMPEG_PATH,
-		"-y", "-i", tmpOut,
+		"-y", "-i", nvencRaw,
 		"-c", "copy",
 		"-movflags", "+faststart",
-		output,
+		remuxOut,
 	)
 	logf("  [NVEnc] faststart remux...")
 	if out, err := remux.CombinedOutput(); err != nil {
 		logf("  [NVEnc] faststart 失败:\n%s", string(out))
 		return fmt.Errorf("faststart remux: %w", err)
+	}
+
+	// remuxOut rename 到 output（即 finalOut+".__tmp__"），由 execEncode 最终 rename 到 finalOut
+	if err := os.Rename(remuxOut, output); err != nil {
+		return fmt.Errorf("rename remux output: %w", err)
 	}
 	return nil
 }
@@ -509,13 +529,10 @@ func runSVTAV1(ctx context.Context, input, output string, info VideoInfo) error 
 
 // ================== 夜间静默 ==================
 
-// quietLogged 防止并发阶段重复打印静默日志：记录上一次打印日志时所在的静默窗口日期。
-// 每个日历日最多打印一次"进入静默"和"已唤醒"。
-var quietLogged time.Time
-
-// sleepIfQuietHour 检查当前本地时间是否落在静默窗口内。
-// 若是，记录日志并阻塞直到 QUIET_END_HOUR:00:00。
-// --dryrun 模式下直接返回，不触发等待。
+// sleepIfQuietHour 在每个文件开始处理前检查本地时间。
+// 若落在 [QUIET_START_HOUR, QUIET_END_HOUR) 区间内，
+// 阻塞直到当天 QUIET_END_HOUR:00:00。
+// --dryrun 模式下不触发等待。
 func sleepIfQuietHour() {
 	if dryRun {
 		return
@@ -523,34 +540,20 @@ func sleepIfQuietHour() {
 	now := time.Now()
 	h := now.Hour()
 	if h < QUIET_START_HOUR || h >= QUIET_END_HOUR {
-		return // 不在静默窗口内
+		return
 	}
-	// 计算今天 QUIET_END_HOUR:00:00 的时刻
 	resume := time.Date(now.Year(), now.Month(), now.Day(),
 		QUIET_END_HOUR, 0, 0, 0, now.Location())
 	waitSec := int(time.Until(resume).Seconds())
 	if waitSec <= 0 {
 		return
 	}
-	// 并发阶段可能有多个 goroutine 同时触发：每个静默窗口（日历日）只打一次日志
-	logMu.Lock()
-	today := now.Truncate(24 * time.Hour)
-	shouldLog := quietLogged.Before(today)
-	if shouldLog {
-		quietLogged = today
-	}
-	logMu.Unlock()
-
-	if shouldLog {
-		logf("[SLEEP] 当前时间 %s，进入夜间静默窗口（%02d:00~%02d:00）",
-			now.Format("15:04:05"), QUIET_START_HOUR, QUIET_END_HOUR)
-		logf("[SLEEP] 等待 %d 秒（约 %s），将于 %02d:00:00 恢复",
-			waitSec, resume.Sub(now).Round(time.Minute), QUIET_END_HOUR)
-	}
+	logf("[SLEEP] 当前时间 %s，进入夜间静默窗口（%02d:00~%02d:00）",
+		now.Format("15:04:05"), QUIET_START_HOUR, QUIET_END_HOUR)
+	logf("[SLEEP] 等待 %d 秒（约 %s），将于 %02d:00:00 恢复",
+		waitSec, resume.Sub(now).Round(time.Minute), QUIET_END_HOUR)
 	time.Sleep(time.Until(resume))
-	if shouldLog {
-		logf("[SLEEP] 已唤醒，继续处理。")
-	}
+	logf("[SLEEP] 已唤醒，继续处理。")
 }
 
 // ================== 各阶段处理函数 ==================
